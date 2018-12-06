@@ -1,3 +1,4 @@
+/* pjlisp  -*- mode: c; -*- */
 /* Global declarations visible only in final .c file.  */
 %{
 #include <math.h>
