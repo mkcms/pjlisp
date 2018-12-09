@@ -70,6 +70,8 @@ struct lisp_object {
     object_type_t type;
 };
 
+object t;                       /* `true` value. */
+
 #define NILP(obj) ((obj) == NULL)
 #define CONSP(obj) (!NILP(obj) && (obj)->type == T_CONS)
 #define FIXNUMP(obj) (!NILP(obj) && (obj)->type == T_FIXNUM)
@@ -203,43 +205,133 @@ object concat(object obj1, object obj2) {
 }
 
 
-/* Lookup */
+/* Hash */
 
-object local_variables = NULL;
-#define UNSET (object)(1)
+/* Modified version of djb2 hash function from
+ * http://www.cse.yorku.ca/~oz/hash.html */
+size_t fasthash(object obj) {
+    if (NILP(obj)) {
+        return 0;
+    }
+    const char *str = (const char *)(obj);
+    size_t hash = 5381;
+    int i = 0;
+    int c;
+    size_t size = sizeof(struct lisp_object);
 
-#define SYMBOL_TABLE_SIZE 128
-object values[SYMBOL_TABLE_SIZE] = {UNSET};
-object symbols[SYMBOL_TABLE_SIZE];
-int nsymbols = 0;
-
-object *lookup(object sym, int create) {
-    if (!SYMBOLP(sym)) {
-        error("lookup: trying to lookup non-symbol");
+    if (FIXNUMP(obj)) {
+        str = (const char *)&obj->fixnum;
+        size = sizeof(obj->fixnum);
+    }
+    while (i++ < size) {
+        c = *str++;
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
     }
 
-    object vars = local_variables;
-    while (CONSP(vars)) {
-        object alist = XCAR(vars);
-        vars = XCDR(vars);
+    return hash;
+}
 
-        while (CONSP(alist)) {
-            if (!strcmp(XSYMBOL(XCAR(XCAR(alist))), XSYMBOL(sym))) {
-                return &alist->car->cdr;
-            }
+size_t hash(object obj) {
+    if (NILP(obj)) {
+        return 0;
+    }
 
-            alist = XCDR(alist);
+    if (obj->type != T_SYMBOL && obj->type != T_STRING) {
+        return fasthash(obj);
+    }
+
+    const char *str = obj->type == T_SYMBOL ? obj->symbol : obj->string;
+    size_t hash = 5381;
+    int c;
+
+    while ((c = *str++) != '\0') {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+
+    return hash;
+}
+
+typedef struct hash_table {
+    size_t nbuckets;
+    size_t nobjects;
+    object *buckets;
+    size_t (*hashfn)(object obj);
+    object (*equalfn)(object a, object b);
+} hash_table;
+
+#define HT_LOAD_FACTOR (0.75)
+
+void hash_put(hash_table *table, object key, object value);
+
+void hash_resize(hash_table *table) {
+    hash_table new;
+    memset(&new, 0, sizeof(hash_table));
+    new.hashfn = table->hashfn;
+    new.equalfn = table->equalfn;
+
+    size_t newsize = table->nbuckets + (size_t)(0.25 * table->nbuckets);
+    if (newsize == table->nbuckets) {
+        newsize++;
+    }
+
+    new.buckets = calloc(newsize, sizeof(object));
+    new.nbuckets = newsize;
+    for (int i = 0; i < table->nbuckets; i++) {
+        object head = table->buckets[i];
+        while (!NILP(head)) {
+            hash_put(&new, XCAR(XCAR(head)), XCDR(XCAR(head)));
+            head = XCDR(head);
         }
     }
 
-    const char *name = XSYMBOL(sym);
-    for (int i = 0; i < nsymbols; i++) {
-        if (!strcmp(XSYMBOL(symbols[i]), name)) {
-            if (values[i] != UNSET || create) {
-                return &values[i];
-            }
-            break;
+    free(table->buckets);
+    table->nobjects = new.nobjects;
+    table->nbuckets = new.nbuckets;
+    table->buckets = new.buckets;
+}
+
+void hash_put(hash_table *table, object key, object value) {
+    if (table->nbuckets == 0 ||
+        (float)(table->nobjects) / table->nbuckets >= HT_LOAD_FACTOR) {
+        hash_resize(table);
+    }
+    size_t h = table->hashfn(key);
+    size_t index = h % table->nbuckets;
+
+    object bucket = table->buckets[index];
+    object head = bucket;
+    while (!NILP(head)) {
+        object elt = XCAR(head);
+
+        if (!NILP(table->equalfn(XCAR(elt), key))) {
+            elt->cdr = value;
+            return;
         }
+
+        head = XCDR(head);
+    }
+    bucket = make_cons(make_cons(key, value), bucket);
+    table->buckets[index] = bucket;
+    table->nobjects++;
+}
+
+object *hash_get(hash_table *table, object key) {
+    if (table->nbuckets == 0) {
+        return NULL;
+    }
+    size_t h = table->hashfn(key);
+    size_t index = h % table->nbuckets;
+
+    object bucket = table->buckets[index];
+    object head = bucket;
+    while (!NILP(head)) {
+        object elt = XCAR(head);
+
+        if (!NILP(table->equalfn(XCAR(elt), key))) {
+            return &elt->cdr;
+        }
+
+        head = XCDR(head);
     }
 
     return NULL;
@@ -293,19 +385,6 @@ object make_string(const char *string, size_t length) {
     return obj;
 }
 
-object intern(const char *name) {
-    for (int i = 0; i < nsymbols; i++) {
-        if (!strcmp(XSYMBOL(symbols[i]), name)) {
-            return symbols[i];
-        }
-    }
-
-    object obj = alloc(T_SYMBOL);
-    obj->symbol = strdup(name);
-    symbols[nsymbols++] = obj;
-    return obj;
-}
-
 object make_special_form(special_form_t func) {
     object obj = alloc(T_SPECIAL_FORM);
     obj->form = func;
@@ -322,6 +401,62 @@ object make_function2(function2_t func) {
     object obj = alloc(T_BUILTIN_FUNCTION_2);
     obj->function2 = func;
     return obj;
+}
+
+
+/* Lookup */
+
+object local_variables = NULL;
+
+hash_table interned_symbols;
+hash_table global_variables;
+
+object intern(const char *name) {
+    struct lisp_object uninterned_obj;
+    uninterned_obj.type = T_STRING;
+    uninterned_obj.string = (char *)name;
+
+    object sym = &uninterned_obj;
+
+    object *interned = hash_get(&interned_symbols, sym);
+    if (interned != NULL) {
+        return *interned;
+    }
+
+    sym = make_string(name, strlen(name));
+    object o = alloc(T_SYMBOL);
+    o->symbol = strdup(name);
+    hash_put(&interned_symbols, sym, o);
+
+    return o;
+}
+
+object *lookup(object sym, int create) {
+    if (!SYMBOLP(sym)) {
+        error("lookup: trying to lookup non-symbol");
+    }
+
+    object vars = local_variables;
+    while (CONSP(vars)) {
+        object alist = XCAR(vars);
+        vars = XCDR(vars);
+
+        while (CONSP(alist)) {
+            if (!strcmp(XSYMBOL(XCAR(XCAR(alist))), XSYMBOL(sym))) {
+                return &alist->car->cdr;
+            }
+
+            alist = XCDR(alist);
+        }
+    }
+
+    object *res = hash_get(&global_variables, sym);
+    if (res != NULL || create == 0) {
+        return res;
+    }
+
+    hash_put(&global_variables, sym, NULL);
+    return hash_get(&global_variables, sym);
 }
 
 
@@ -754,12 +889,12 @@ object Feq(object obj1, object obj2) {
     } else {
         res = obj1 == obj2;
     }
-    return res == 0 ? NULL : intern("t");
+    return res == 0 ? NULL : t;
 }
 
 object Fequal(object obj1, object obj2) {
     if (!NILP(Feq(obj1, obj2))) {
-        return intern("t");
+        return t;
     }
     int res = 0;
     if (STRINGP(obj1) && STRINGP(obj2)) {
@@ -768,7 +903,7 @@ object Fequal(object obj1, object obj2) {
         res = !NILP(Fequal(XCAR(obj1), XCAR(obj2))) &&
               !NILP(Fequal(XCDR(obj1), XCDR(obj2)));
     }
-    return res == 0 ? NULL : intern("t");
+    return res == 0 ? NULL : t;
 }
 
 object Fif(object args) {
@@ -821,79 +956,66 @@ object Fprint(object obj) {
 /* main */
 
 void setup_builtins() {
-    symbols[nsymbols] = intern("nil");
-    values[nsymbols - 1] = NULL;
+    t = make_fixnum(1);
 
-    symbols[nsymbols] = intern("t");
-    values[nsymbols - 1] = intern("t");
+    Fset(intern("nil"), NULL);
 
-    symbols[nsymbols] = intern("quote");
-    values[nsymbols - 1] = make_special_form(Fquote);
+    Fset(intern("t"), intern("t"));
+    t = intern("t");
 
-    symbols[nsymbols] = intern("set");
-    values[nsymbols - 1] = make_function2(Fset);
+    Fset(intern("quote"), make_special_form(Fquote));
 
-    symbols[nsymbols] = intern("lambda");
-    values[nsymbols - 1] = make_special_form(Flambda);
+    Fset(intern("set"), make_function2(Fset));
 
-    symbols[nsymbols] = intern("let");
-    values[nsymbols - 1] = make_special_form(Flet);
+    Fset(intern("lambda"), make_special_form(Flambda));
 
-    symbols[nsymbols] = intern("not");
-    values[nsymbols - 1] = make_function1(Fnot);
+    Fset(intern("let"), make_special_form(Flet));
 
-    symbols[nsymbols] = intern("stringify");
-    values[nsymbols - 1] = make_function1(Fstringify);
+    Fset(intern("not"), make_function1(Fnot));
 
-    symbols[nsymbols] = intern("print");
-    values[nsymbols - 1] = make_function1(Fprint);
+    Fset(intern("stringify"), make_function1(Fstringify));
 
-    symbols[nsymbols] = intern("+");
-    values[nsymbols - 1] = make_special_form(Fplus);
+    Fset(intern("print"), make_function1(Fprint));
 
-    symbols[nsymbols] = intern("-");
-    values[nsymbols - 1] = make_special_form(Fminus);
+    Fset(intern("+"), make_special_form(Fplus));
 
-    symbols[nsymbols] = intern("*");
-    values[nsymbols - 1] = make_special_form(Fmultiply);
+    Fset(intern("-"), make_special_form(Fminus));
 
-    symbols[nsymbols] = intern("length");
-    values[nsymbols - 1] = make_function1(Flength);
+    Fset(intern("*"), make_special_form(Fmultiply));
 
-    symbols[nsymbols] = intern("cons");
-    values[nsymbols - 1] = make_function2(Fcons);
+    Fset(intern("length"), make_function1(Flength));
 
-    symbols[nsymbols] = intern("car");
-    values[nsymbols - 1] = make_function1(Fcar);
+    Fset(intern("cons"), make_function2(Fcons));
 
-    symbols[nsymbols] = intern("cdr");
-    values[nsymbols - 1] = make_function1(Fcdr);
+    Fset(intern("car"), make_function1(Fcar));
 
-    symbols[nsymbols] = intern("<");
-    values[nsymbols - 1] = make_function2(Fless);
+    Fset(intern("cdr"), make_function1(Fcdr));
 
-    symbols[nsymbols] = intern("progn");
-    values[nsymbols - 1] = make_special_form(Fprogn);
+    Fset(intern("<"), make_function2(Fless));
 
-    symbols[nsymbols] = intern("if");
-    values[nsymbols - 1] = make_special_form(Fif);
+    Fset(intern("progn"), make_special_form(Fprogn));
 
-    symbols[nsymbols] = intern("eq");
-    values[nsymbols - 1] = make_function2(Feq);
+    Fset(intern("if"), make_special_form(Fif));
 
-    symbols[nsymbols] = intern("equal");
-    values[nsymbols - 1] = make_function2(Fequal);
+    Fset(intern("eq"), make_function2(Feq));
 
-    symbols[nsymbols] = intern("while");
-    values[nsymbols - 1] = make_special_form(Fwhile);
+    Fset(intern("equal"), make_function2(Fequal));
+
+    Fset(intern("while"), make_special_form(Fwhile));
 }
 
 int main(int argc, char **argv) {
     bool repl = argc > 1 && !strcmp(argv[1], "--repl");
 
-    for (int i = 0; i < SYMBOL_TABLE_SIZE; i++) {
-        values[i] = UNSET;
-    }
+    memset(&interned_symbols, 0, sizeof(hash_table));
+    memset(&global_variables, 0, sizeof(hash_table));
+
+    interned_symbols.hashfn = hash;
+    interned_symbols.equalfn = Fequal;
+
+    global_variables.hashfn = fasthash;
+    global_variables.equalfn = Feq;
+
     setup_builtins();
 
     while (1) {
