@@ -68,6 +68,7 @@ struct lisp_object {
         struct lambda *lambda;
     };
     object_type_t type;
+    int gcbits;
 };
 
 object t;                       /* `true` value. */
@@ -83,6 +84,10 @@ object t;                       /* `true` value. */
 #define XINT(obj) ((obj)->fixnum)
 #define XSYMBOL(obj) ((obj)->symbol)
 #define XSTRING(obj) ((obj)->string)
+
+#define GC_UNVISITED 0
+#define GC_DELETE 1
+#define GC_KEEP 2
 
 #define error(fmt, ...)                                                        \
     do {                                                                       \
@@ -355,7 +360,7 @@ object alloc(object_type_t type) {
         free(old);
     }
 
-    object obj = malloc(sizeof(struct lisp_object));
+    object obj = calloc(1, sizeof(struct lisp_object));
     obj->type = type;
     objects[nobjects++] = obj;
     return obj;
@@ -594,6 +599,91 @@ object eval(object obj) {
     }
 
     error("eval");
+}
+
+
+/* Garbage collector. */
+
+void free_object(object obj) {
+    if (NILP(obj)) {
+        return;
+    } else if (STRINGP(obj)) {
+        free(XSTRING(obj));
+    } else if (SYMBOLP(obj)) {
+        free(XSYMBOL(obj));
+    } else if (obj->type == T_LAMBDA) {
+        free(obj->lambda);
+    }
+
+    free(obj);
+}
+
+void mark_object(object obj, int flag) {
+    if (NILP(obj) || obj->gcbits == flag) {
+        return;
+    }
+
+    obj->gcbits = flag;
+
+    if (CONSP(obj)) {
+        mark_object(XCAR(obj), flag);
+        mark_object(XCDR(obj), flag);
+    } else if (obj->type == T_LAMBDA) {
+        mark_object(obj->lambda->body, flag);
+        mark_object(obj->lambda->argumentlist, flag);
+    }
+}
+
+void garbage_collect() {
+    /* Mark all objects */
+    for (int i = 0; i < nobjects; i++) {
+        if (!NILP(objects[i])) {
+            objects[i]->gcbits = GC_DELETE;
+        }
+    }
+
+    for (int i = 0; i < interned_symbols.nbuckets; i++) {
+        object var = interned_symbols.buckets[i];
+        mark_object(var, GC_KEEP);
+    }
+
+    for (int i = 0; i < global_variables.nbuckets; i++) {
+        object var = global_variables.buckets[i];
+        mark_object(var, GC_KEEP);
+    }
+
+    for (int i = 0; i < local_variables.nbuckets; i++) {
+        object var = local_variables.buckets[i];
+        mark_object(var, GC_KEEP);
+    }
+
+    mark_object(parsed, GC_KEEP);
+    mark_object(t, GC_KEEP);
+
+    size_t after_deletion = 0;
+    for (int i = 0; i < nobjects; i++) {
+        if (NILP(objects[i])) {
+            continue;
+        }
+        if (objects[i]->gcbits == GC_DELETE) {
+            free_object(objects[i]);
+            objects[i] = NULL;
+        } else {
+            after_deletion++;
+        }
+    }
+
+    object *newobjects = malloc(after_deletion * sizeof(*objects));
+    for (int i = 0, j = 0; i < nobjects; i++) {
+        if (!NILP(objects[i])) {
+            newobjects[j++] = objects[i];
+        }
+    }
+
+    capacity = after_deletion;
+    free(objects);
+    objects = newobjects;
+    nobjects = after_deletion;
 }
 
 
@@ -972,6 +1062,15 @@ object Fprint(object obj) {
     return obj;
 }
 
+object Fgarbage_collect(object args) {
+    if (!NILP(args)) {
+        signal(intern("wrong-number-of-arguments"), make_fixnum(0));
+        return NULL;
+    }
+    garbage_collect();
+    return NULL;
+}
+
 
 /* main */
 
@@ -1022,6 +1121,8 @@ void setup_builtins() {
     Fset(intern("equal"), make_function2(Fequal));
 
     Fset(intern("while"), make_special_form(Fwhile));
+
+    Fset(intern("garbage-collect"), make_special_form(Fgarbage_collect));
 }
 
 int main(int argc, char **argv) {
@@ -1060,6 +1161,7 @@ int main(int argc, char **argv) {
         if (repl) {
             Fprint(res);
         }
+        garbage_collect();
 
     handle_error:
         if (current_signal) {
