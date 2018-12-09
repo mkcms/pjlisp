@@ -406,10 +406,9 @@ object make_function2(function2_t func) {
 
 /* Lookup */
 
-object local_variables = NULL;
-
 hash_table interned_symbols;
 hash_table global_variables;
+hash_table local_variables;
 
 object intern(const char *name) {
     struct lisp_object uninterned_obj;
@@ -431,26 +430,36 @@ object intern(const char *name) {
     return o;
 }
 
+void push_local_variable(object sym, object value) {
+    object *elt = hash_get(&local_variables, sym);
+    if (!elt) {
+        object cons = make_cons(value, NULL);
+        hash_put(&local_variables, sym, cons);
+        return;
+    }
+
+    *elt = make_cons(value, *elt);
+}
+
+void pop_local_variable(object sym) {
+    object *elt = hash_get(&local_variables, sym);
+    if (!elt) {
+        error("pop_local_variable: missing");
+    }
+    *elt = XCDR(*elt);
+}
+
 object *lookup(object sym, int create) {
     if (!SYMBOLP(sym)) {
         error("lookup: trying to lookup non-symbol");
     }
 
-    object vars = local_variables;
-    while (CONSP(vars)) {
-        object alist = XCAR(vars);
-        vars = XCDR(vars);
-
-        while (CONSP(alist)) {
-            if (!strcmp(XSYMBOL(XCAR(XCAR(alist))), XSYMBOL(sym))) {
-                return &alist->car->cdr;
-            }
-
-            alist = XCDR(alist);
-        }
+    object *res = hash_get(&local_variables, sym);
+    if (res != NULL && !NILP(*res)) {
+        return &(*res)->car;
     }
 
-    object *res = hash_get(&global_variables, sym);
+    res = hash_get(&global_variables, sym);
     if (res != NULL || create == 0) {
         return res;
     }
@@ -469,30 +478,31 @@ void signal(object error_symbol, object data) {
 }
 
 object eval_lambda(struct lambda *lambda, object args) {
-    object argument_alist = NULL;
+    object res = NULL;
+    int nvars = 0;
     object lambda_symbol = lambda->argumentlist;
+
     while (CONSP(args)) {
         if (NILP(lambda_symbol)) {
             signal(intern("wrong-number-of-arguments"), NULL);
-            return NULL;
+            goto cleanup;
         }
         object arg = eval(XCAR(args));
         if (!NILP(current_signal)) {
-            return NULL;
+            goto cleanup;
         }
-        args = XCDR(args);
-        argument_alist =
-            make_cons(make_cons(XCAR(lambda_symbol), arg), argument_alist);
+
+        push_local_variable(XCAR(lambda_symbol), arg);
+        nvars++;
+
         lambda_symbol = XCDR(lambda_symbol);
+        args = XCDR(args);
     }
     if (CONSP(lambda_symbol)) {
         signal(intern("wrong-number-of-arguments"), NULL);
-        return NULL;
+        goto cleanup;
     }
 
-    local_variables = make_cons(argument_alist, local_variables);
-
-    object res = NULL;
     object body = lambda->body;
     while (CONSP(body)) {
         res = eval(XCAR(body));
@@ -502,8 +512,12 @@ object eval_lambda(struct lambda *lambda, object args) {
         body = XCDR(body);
     }
 
-    local_variables = XCDR(local_variables);
-
+cleanup:
+    lambda_symbol = lambda->argumentlist;
+    while (nvars-- > 0) {
+        pop_local_variable(XCAR(lambda_symbol));
+        lambda_symbol = XCDR(lambda_symbol);
+    }
     return res;
 }
 
@@ -758,44 +772,50 @@ object Flet(object args) {
         return NULL;
     }
 
-    object variable_alist = NULL;
-
+    object result = NULL;
     object arglist = XCAR(args);
     object body = XCDR(args);
+    int nvars = 0;
 
     while (CONSP(arglist)) {
         object elt = XCAR(arglist);
         if (!CONSP(elt)) {
             signal(intern("lisp-error"), make_cons(intern("consp"), elt));
-            return NULL;
+            goto cleanup;
         }
         if (!SYMBOLP(XCAR(elt))) {
             signal(intern("lisp-error"),
                    make_cons(intern("symbolp"), XCAR(elt)));
-            return NULL;
+            goto cleanup;
         }
         if (!CONSP(XCDR(elt))) {
             signal(intern("lisp-error"), NULL);
-            return NULL;
+            goto cleanup;
         }
         if (!NILP(XCDR(XCDR(elt)))) {
             signal(intern("lisp-error"), NULL);
-            return NULL;
+            goto cleanup;
         }
 
         object symbol = XCAR(elt);
         object value = eval(XCAR(XCDR(elt)));
         if (!NILP(current_signal)) {
-            return NULL;
+            goto cleanup;
         }
 
-        variable_alist = make_cons(make_cons(symbol, value), variable_alist);
+        push_local_variable(symbol, value);
+        nvars++;
         arglist = XCDR(arglist);
     }
 
-    local_variables = make_cons(variable_alist, local_variables);
-    object result = Fprogn(body);
-    local_variables = XCDR(local_variables);
+    result = Fprogn(body);
+
+cleanup:
+    arglist = XCAR(args);
+    while (nvars--) {
+        pop_local_variable(XCAR(XCAR(arglist)));
+        arglist = XCDR(arglist);
+    }
     return result;
 }
 
@@ -1009,12 +1029,16 @@ int main(int argc, char **argv) {
 
     memset(&interned_symbols, 0, sizeof(hash_table));
     memset(&global_variables, 0, sizeof(hash_table));
+    memset(&local_variables, 0, sizeof(hash_table));
 
     interned_symbols.hashfn = hash;
     interned_symbols.equalfn = Fequal;
 
     global_variables.hashfn = fasthash;
     global_variables.equalfn = Feq;
+
+    local_variables.hashfn = fasthash;
+    local_variables.equalfn = Feq;
 
     setup_builtins();
 
