@@ -743,6 +743,8 @@ object Flength(object sequence) {
 
 object Fcons(object car, object cdr) { return make_cons(car, cdr); }
 
+object Fconcat(object obj1, object obj2) { return concat(obj1, obj2); }
+
 object Fcar(object arg) {
     if (!(NILP(arg) || CONSP(arg))) {
         signal(intern("wrong-type-argument"), intern("consp"));
@@ -1123,6 +1125,8 @@ void setup_builtins() {
     Fset(intern("while"), make_special_form(Fwhile));
 
     Fset(intern("garbage-collect"), make_special_form(Fgarbage_collect));
+
+    Fset(intern("concat"), make_function2(Fconcat));
 }
 
 int main(int argc, char **argv) {
