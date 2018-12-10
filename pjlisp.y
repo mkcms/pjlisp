@@ -249,6 +249,11 @@ size_t fasthash(object obj) {
     if (NILP(obj)) {
         return 0;
     }
+    /* FIXME: We don't want to include gc flags in the hash, but this
+     * is rather ugly.  This also needs to be fixed below.  */
+    int gcbits = obj->gcbits;
+    obj->gcbits = 0;
+
     const char *str = (const char *)(obj);
     size_t hash = 5381;
     int i = 0;
@@ -264,6 +269,8 @@ size_t fasthash(object obj) {
         hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
     }
 
+    obj->gcbits = gcbits;
+
     return hash;
 }
 
@@ -271,6 +278,9 @@ size_t hash(object obj) {
     if (NILP(obj)) {
         return 0;
     }
+
+    int gcbits = obj->gcbits;
+    obj->gcbits = 0;
 
     if (obj->type != T_SYMBOL && obj->type != T_STRING) {
         return fasthash(obj);
@@ -284,6 +294,7 @@ size_t hash(object obj) {
         hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
     }
 
+    obj->gcbits = gcbits;
     return hash;
 }
 
