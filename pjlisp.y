@@ -592,6 +592,7 @@ object eval(object obj) {
     case T_FIXNUM:
     case T_STRING:
     case T_BUILTIN:
+    case T_LAMBDA:
         return obj;
     }
 
@@ -1013,6 +1014,34 @@ cleanup:
     return result;
 }
 
+DEFUN("map", Smap, Fmap, 2)
+(object function, object sequence) {
+    if (NILP(sequence) || !assert_type(sequence, T_CONS)) {
+        return NULL;
+    }
+
+    object tail = NULL;
+    object res;
+
+    while (CONSP(sequence)) {
+        /* FIXME: Ugly hack to evaluate dynamic functions.  */
+        object mapped_val = eval(make_cons(function, make_cons(XCAR(sequence), NULL)));
+        if (!NILP(current_signal)) {
+            break;
+        }
+        if (NILP(tail)) {
+            tail = res = make_cons(mapped_val, NULL);
+        } else {
+            tail->cdr = make_cons(mapped_val, NULL);
+            tail = XCDR(tail);
+        }
+        sequence = XCDR(sequence);
+    }
+
+    return res;
+}
+
+
 DEFUN("+", Splus, Fplus, MANY)
 (object args) {
     int ret = 0;
@@ -1191,6 +1220,7 @@ void setup_builtins() {
 
     defsym(&Slambda);
     defsym(&Slet);
+    defsym(&Smap);
 
     defsym(&Sprint);
     defsym(&Splus);

@@ -335,3 +335,12 @@ lisp_test "while" <<EOF
 3
 4
 EOF
+
+
+lisp_test "map"<<EOF
+(print (map (lambda (x)) '(1 2 3)))
+(print (map (lambda (x) (* x 2)) '(1 2 3)))
+---
+(nil nil nil)
+(2 4 6)
+EOF
