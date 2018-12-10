@@ -30,23 +30,15 @@ typedef enum {
     T_STRING,
     T_SYMBOL,
     T_FIXNUM,
-    T_SPECIAL_FORM,
-    T_BUILTIN_FUNCTION_1,
-    T_BUILTIN_FUNCTION_2,
-    T_LAMBDA,
+    T_BUILTIN,                  /* Built-in function. */
+    T_LAMBDA,                   /* Lambda function. */
 } object_type_t;
 
-/* Signature for functions which behave like "macros".  Arguments to
- * these functions are not evaluated.  The argument is a cons.  */
-typedef object (*special_form_t)(object args);
-
-/* Signature for a builtin function accepting one argument.  The
- * argument is already evaluated.  */
-typedef object (*function1_t)(object arg);
-
-/* Signature for a builtin function accepting two arguments.  Both
- * arguments are already evaluated.  */
-typedef object (*function2_t)(object arg1, object arg2);
+struct builtin {
+    object (*dispatch_fn)(void *fnptr, object args);
+    void *ptr;
+    const char *name;
+};
 
 struct lambda {
     object argumentlist;
@@ -62,10 +54,8 @@ struct lisp_object {
         char *string;
         const char *symbol;
         int fixnum;
-        special_form_t form;
-        function1_t function1;
-        function2_t function2;
         struct lambda *lambda;
+        struct builtin *builtin;
     };
     object_type_t type;
     int gcbits;
@@ -390,24 +380,6 @@ object make_string(const char *string, size_t length) {
     return obj;
 }
 
-object make_special_form(special_form_t func) {
-    object obj = alloc(T_SPECIAL_FORM);
-    obj->form = func;
-    return obj;
-}
-
-object make_function1(function1_t func) {
-    object obj = alloc(T_BUILTIN_FUNCTION_1);
-    obj->function1 = func;
-    return obj;
-}
-
-object make_function2(function2_t func) {
-    object obj = alloc(T_BUILTIN_FUNCTION_2);
-    obj->function2 = func;
-    return obj;
-}
-
 
 /* Lookup */
 
@@ -546,36 +518,9 @@ object eval(object obj) {
             signal(intern("wrong-type-argument"), intern("listp"));
             return NULL;
         }
-        if (function->type == T_SPECIAL_FORM) {
-            return function->form(args);
-        }
-        if (function->type == T_BUILTIN_FUNCTION_1) {
-            if (nargs != 1) {
-                signal(intern("wrong-number-of-arguments"), make_fixnum(1));
-                return NULL;
-            }
-
-            object arg = eval(XCAR(args));
-            if (!NILP(current_signal)) {
-                return NULL;
-            }
-            return function->function1(arg);
-        }
-        if (function->type == T_BUILTIN_FUNCTION_2) {
-            if (nargs != 2) {
-                signal(intern("wrong-number-of-arguments"), make_fixnum(2));
-                return NULL;
-            }
-
-            object arg1 = eval(XCAR(args));
-            if (!NILP(current_signal)) {
-                return NULL;
-            }
-            object arg2 = eval(XCAR(XCDR(args)));
-            if (!NILP(current_signal)) {
-                return NULL;
-            }
-            return function->function2(arg1, arg2);
+        if (function->type == T_BUILTIN) {
+            struct builtin *builtin = function->builtin;
+            return builtin->dispatch_fn(builtin->ptr, args);
         }
         if (function->type == T_LAMBDA) {
             struct lambda *lambda = function->lambda;
@@ -594,7 +539,7 @@ object eval(object obj) {
     }
     case T_FIXNUM:
     case T_STRING:
-    case T_SPECIAL_FORM:
+    case T_BUILTIN:
         return obj;
     }
 
@@ -689,15 +634,124 @@ void garbage_collect() {
 
 /* Built-in functions. */
 
-object Fquote(object args) {
-    if (NILP(args) || !NILP(XCDR(args))) {
-        signal(intern("wrong-number-of-arguments"), make_fixnum(1));
-        return NULL;
+/* Helpers for dispatching */
+#define ARGLIST_0 ()
+#define ARGLIST_1 (object)
+#define ARGLIST_2 (object, object)
+#define ARGLIST_MANY (object)
+
+#define DEFINE_BUILTIN(lisp_name, struct_name, function_name, nargs,           \
+                       dispatch_function)                                      \
+    object function_name ARGLIST_##nargs;                                      \
+    struct builtin struct_name = {.dispatch_fn = dispatch_function,            \
+                                  .ptr = function_name,                        \
+                                  .name = lisp_name};                          \
+    object function_name
+
+#define DEFUN(lisp_name, struct_name, function_name, nargs)                    \
+    DEFINE_BUILTIN(lisp_name, struct_name, function_name, nargs,               \
+                   dispatch_##nargs)
+
+#define DEFMACRO(lisp_name, struct_name, function_name, nargs)                 \
+    DEFINE_BUILTIN(lisp_name, struct_name, function_name, nargs,               \
+                   dispatch_unevalled_##nargs)
+
+int assert_argument_count(object cons, ptrdiff_t expected_len) {
+    ptrdiff_t len = length(cons);
+    if (len != expected_len) {
+        signal(intern("wrong-number-of-arguments"),
+               make_cons(make_fixnum(expected_len), make_fixnum(len)));
+        return 0;
     }
-    return XCAR(args);
+    return 1;
 }
 
-object Fprogn(object args) {
+#define ASSERT_ARGUMENT_COUNT(cons, nargs)                                     \
+    do {                                                                       \
+        if (!assert_argument_count(cons, nargs))                               \
+            return NULL;                                                       \
+    } while (false);
+
+object dispatch_0(void *fnptr, object args) {
+    ASSERT_ARGUMENT_COUNT(args, 0);
+
+    object (*fn)() = fnptr;
+    return fn();
+}
+
+object dispatch_1(void *fnptr, object args) {
+    ASSERT_ARGUMENT_COUNT(args, 1);
+
+    object (*fn)(object) = fnptr;
+
+    object arg = eval(XCAR(args));
+    if (!NILP(current_signal)) {
+        return NULL;
+    }
+
+    return fn(arg);
+}
+
+object dispatch_unevalled_1(void *fnptr, object args) {
+    ASSERT_ARGUMENT_COUNT(args, 1);
+
+    object (*fn)(object) = fnptr;
+
+    return fn(XCAR(args));
+}
+
+object dispatch_2(void *fnptr, object args) {
+    ASSERT_ARGUMENT_COUNT(args, 2);
+
+    object (*fn)(object, object) = fnptr;
+
+    object arg1 = eval(XCAR(args));
+    if (!NILP(current_signal)) {
+        return NULL;
+    }
+
+    object arg2 = eval(XCAR(XCDR(args)));
+    if (!NILP(current_signal)) {
+        return NULL;
+    }
+
+    return fn(arg1, arg2);
+}
+
+object dispatch_MANY(void *fnptr, object args) {
+    object (*fn)(object) = fnptr;
+
+    object evaluated_arg = NULL;
+    object evaluated_arglist = NULL;
+    while (CONSP(args)) {
+        object arg = eval(XCAR(args));
+        args = XCDR(args);
+        if (!NILP(current_signal)) {
+            return NULL;
+        }
+        if (NILP(evaluated_arg)) {
+            evaluated_arg = evaluated_arglist = make_cons(arg, NULL);
+        } else {
+            evaluated_arg->cdr = make_cons(arg, NULL);
+            evaluated_arg = XCDR(evaluated_arg);
+        }
+    }
+
+    return fn(evaluated_arglist);
+}
+
+object dispatch_unevalled_MANY(void *fnptr, object args) {
+    object (*fn)(object) = fnptr;
+    return fn(args);
+}
+
+/* Builtins */
+
+DEFMACRO("quote", Squote, Fquote, 1)
+(object arg) { return arg; }
+
+DEFMACRO("progn", Sprogn, Fprogn, MANY)
+(object args) {
     object res = NULL;
 
     while (CONSP(args)) {
@@ -711,7 +765,8 @@ object Fprogn(object args) {
     return res;
 }
 
-object Fset(object symbol, object value) {
+DEFUN("set", Sset, Fset, 2)
+(object symbol, object value) {
     if (!SYMBOLP(symbol)) {
         signal(intern("wrong-type-argument"),
                make_cons(intern("symbolp"), symbol));
@@ -724,14 +779,16 @@ object Fset(object symbol, object value) {
     return value;
 }
 
-object Fnot(object arg) {
+DEFUN("not", Snot, Fnot, 1)
+(object arg) {
     if (NILP(arg)) {
         return intern("t");
     }
     return NULL;
 }
 
-object Flength(object sequence) {
+DEFUN("length", Slength, Flength, 1)
+(object sequence) {
     ptrdiff_t len = length(sequence);
     if (len < 0) {
         signal(intern("wrong-type-argument"),
@@ -741,11 +798,14 @@ object Flength(object sequence) {
     return make_fixnum(len);
 }
 
-object Fcons(object car, object cdr) { return make_cons(car, cdr); }
+DEFUN("cons", Scons, Fcons, 2)
+(object car, object cdr) { return make_cons(car, cdr); }
 
-object Fconcat(object obj1, object obj2) { return concat(obj1, obj2); }
+DEFUN("concat", Sconcat, Fconcat, 2)
+(object obj1, object obj2) { return concat(obj1, obj2); }
 
-object Fcar(object arg) {
+DEFUN("car", Scar, Fcar, 1)
+(object arg) {
     if (!(NILP(arg) || CONSP(arg))) {
         signal(intern("wrong-type-argument"), intern("consp"));
         return NULL;
@@ -754,7 +814,8 @@ object Fcar(object arg) {
     return XCAR(arg);
 }
 
-object Fcdr(object arg) {
+DEFUN("cdr", Scdr, Fcdr, 1)
+(object arg) {
     if (!(NILP(arg) || CONSP(arg))) {
         signal(intern("wrong-type-argument"), intern("consp"));
         return NULL;
@@ -763,7 +824,8 @@ object Fcdr(object arg) {
     return XCDR(arg);
 }
 
-object Fstringify(object obj) {
+DEFUN("stringify", Sstringify, Fstringify, 1)
+(object obj) {
     if (NILP(obj)) {
         return make_string("nil", 3);
     }
@@ -811,17 +873,9 @@ object Fstringify(object obj) {
         return obj;
     case T_SYMBOL:
         return make_string(XSYMBOL(obj), strlen(XSYMBOL(obj)));
-    case T_SPECIAL_FORM:
-    case T_BUILTIN_FUNCTION_2:
-    case T_BUILTIN_FUNCTION_1: {
+    case T_BUILTIN: {
         char s[128];
-        if (obj->type == T_SPECIAL_FORM) {
-            sprintf(s, "special form at %p", obj->form);
-        } else if (obj->type == T_BUILTIN_FUNCTION_1) {
-            sprintf(s, "built-in function at %p", obj->function1);
-        } else if (obj->type == T_BUILTIN_FUNCTION_2) {
-            sprintf(s, "built-in function at %p", obj->function2);
-        }
+        sprintf(s, "builtin function %s", obj->builtin->name);
         return make_string(s, strlen(s));
     }
     case T_LAMBDA:
@@ -831,7 +885,8 @@ object Fstringify(object obj) {
     }
 }
 
-object Flambda(object args) {
+DEFMACRO("lambda", Slambda, Flambda, MANY)
+(object args) {
     if (!CONSP(XCAR(args)) && !NILP(XCAR(args))) {
         signal(intern("wrong-type-argument"), intern("consp"));
         return NULL;
@@ -858,7 +913,8 @@ object Flambda(object args) {
     return ret;
 }
 
-object Flet(object args) {
+DEFMACRO("let", Slet, Flet, MANY)
+(object args) {
     if (!CONSP(XCAR(args)) && !NILP(XCAR(args))) {
         signal(intern("wrong-type-argument"), intern("consp"));
         return NULL;
@@ -911,14 +967,12 @@ cleanup:
     return result;
 }
 
-object Fplus(object args) {
+DEFUN("+", Splus, Fplus, MANY)
+(object args) {
     int ret = 0;
 
     while (CONSP(args)) {
-        object val = eval(XCAR(args));
-        if (!NILP(current_signal)) {
-            return NULL;
-        }
+        object val = XCAR(args);
         if (!FIXNUMP(val)) {
             signal(intern("wrong-type-argument"), intern("numberp"));
             return NULL;
@@ -930,14 +984,16 @@ object Fplus(object args) {
     return make_fixnum(ret);
 }
 
-object Fminus(object args) {
+DEFUN("-", Sminus, Fminus, MANY)
+(object args) {
     int ret = 0;
 
     if (CONSP(args)) {
-        ret = XINT(eval(XCAR(args)));
-        if (!NILP(current_signal)) {
+        if (!FIXNUMP(XCAR(args))) {
+            signal(intern("wrong-type-argument"), intern("numberp"));
             return NULL;
         }
+        ret = XINT(XCAR(args));
         args = XCDR(args);
         if (!CONSP(args)) {
             ret = -ret;
@@ -945,10 +1001,7 @@ object Fminus(object args) {
     }
 
     while (CONSP(args)) {
-        object val = eval(XCAR(args));
-        if (!NILP(current_signal)) {
-            return NULL;
-        }
+        object val = XCAR(args);
         if (!FIXNUMP(val)) {
             signal(intern("wrong-type-argument"), intern("numberp"));
             return NULL;
@@ -960,14 +1013,12 @@ object Fminus(object args) {
     return make_fixnum(ret);
 }
 
-object Fmultiply(object args) {
+DEFUN("*", Smultiply, Fmultiply, MANY)
+(object args) {
     int ret = 1;
 
     while (CONSP(args)) {
-        object val = eval(XCAR(args));
-        if (!NILP(current_signal)) {
-            return NULL;
-        }
+        object val = XCAR(args);
         if (!FIXNUMP(val)) {
             signal(intern("wrong-type-argument"), intern("numberp"));
             return NULL;
@@ -979,7 +1030,8 @@ object Fmultiply(object args) {
     return make_fixnum(ret);
 }
 
-object Fless(object number1, object number2) {
+DEFUN("<", Sless, Fless, 2)
+(object number1, object number2) {
     if (!FIXNUMP(number1)) {
         signal(intern("wrong-type-argument"), number1);
         return NULL;
@@ -994,7 +1046,8 @@ object Fless(object number1, object number2) {
     return NULL;
 }
 
-object Feq(object obj1, object obj2) {
+DEFUN("eq", Seq, Feq, 2)
+(object obj1, object obj2) {
     int res;
     if (FIXNUMP(obj1) && FIXNUMP(obj2)) {
         res = XINT(obj1) == XINT(obj2);
@@ -1004,7 +1057,8 @@ object Feq(object obj1, object obj2) {
     return res == 0 ? NULL : t;
 }
 
-object Fequal(object obj1, object obj2) {
+DEFUN("equal", Sequal, Fequal, 2)
+(object obj1, object obj2) {
     if (!NILP(Feq(obj1, obj2))) {
         return t;
     }
@@ -1018,7 +1072,8 @@ object Fequal(object obj1, object obj2) {
     return res == 0 ? NULL : t;
 }
 
-object Fif(object args) {
+DEFMACRO("if", Sif, Fif, MANY)
+(object args) {
     object cond = eval(XCAR(args));
 
     if (!NILP(current_signal)) {
@@ -1032,7 +1087,8 @@ object Fif(object args) {
     return Fprogn(XCDR(XCDR(args)));
 }
 
-object Fwhile(object args) {
+DEFMACRO("while", Swhile, Fwhile, MANY)
+(object args) {
     object res = NULL;
 
     while (1) {
@@ -1050,7 +1106,8 @@ object Fwhile(object args) {
     return res;
 }
 
-object Fprint(object obj) {
+DEFUN("print", Sprint, Fprint, 1)
+(object obj) {
     if (STRINGP(obj)) {
         printf("\"%s\"\n", XSTRING(obj));
     } else if (SYMBOLP(obj)) {
@@ -1064,17 +1121,19 @@ object Fprint(object obj) {
     return obj;
 }
 
-object Fgarbage_collect(object args) {
-    if (!NILP(args)) {
-        signal(intern("wrong-number-of-arguments"), make_fixnum(0));
-        return NULL;
-    }
+DEFUN("garbage-collect", Sgarbage_collect, Fgarbage_collect, 0)() {
     garbage_collect();
     return NULL;
 }
 
 
 /* main */
+
+void defsym(struct builtin* builtin) {
+    object obj = alloc(T_BUILTIN);
+    obj->builtin = builtin;
+    Fset(intern(builtin->name), obj);
+}
 
 void setup_builtins() {
     t = make_fixnum(1);
@@ -1084,49 +1143,31 @@ void setup_builtins() {
     Fset(intern("t"), intern("t"));
     t = intern("t");
 
-    Fset(intern("quote"), make_special_form(Fquote));
+    defsym(&Squote);
+    defsym(&Sset);
+    defsym(&Snot);
+    defsym(&Slength);
+    defsym(&Scons);
+    defsym(&Sstringify);
+    defsym(&Scar);
+    defsym(&Scdr);
 
-    Fset(intern("set"), make_function2(Fset));
+    defsym(&Slambda);
+    defsym(&Slet);
 
-    Fset(intern("lambda"), make_special_form(Flambda));
+    defsym(&Sprint);
+    defsym(&Splus);
+    defsym(&Sminus);
+    defsym(&Smultiply);
+    defsym(&Sless);
+    defsym(&Sprogn);
 
-    Fset(intern("let"), make_special_form(Flet));
-
-    Fset(intern("not"), make_function1(Fnot));
-
-    Fset(intern("stringify"), make_function1(Fstringify));
-
-    Fset(intern("print"), make_function1(Fprint));
-
-    Fset(intern("+"), make_special_form(Fplus));
-
-    Fset(intern("-"), make_special_form(Fminus));
-
-    Fset(intern("*"), make_special_form(Fmultiply));
-
-    Fset(intern("length"), make_function1(Flength));
-
-    Fset(intern("cons"), make_function2(Fcons));
-
-    Fset(intern("car"), make_function1(Fcar));
-
-    Fset(intern("cdr"), make_function1(Fcdr));
-
-    Fset(intern("<"), make_function2(Fless));
-
-    Fset(intern("progn"), make_special_form(Fprogn));
-
-    Fset(intern("if"), make_special_form(Fif));
-
-    Fset(intern("eq"), make_function2(Feq));
-
-    Fset(intern("equal"), make_function2(Fequal));
-
-    Fset(intern("while"), make_special_form(Fwhile));
-
-    Fset(intern("garbage-collect"), make_special_form(Fgarbage_collect));
-
-    Fset(intern("concat"), make_function2(Fconcat));
+    defsym(&Sif);
+    defsym(&Swhile);
+    defsym(&Seq);
+    defsym(&Sequal);
+    defsym(&Sgarbage_collect);
+    defsym(&Sconcat);
 }
 
 int main(int argc, char **argv) {
