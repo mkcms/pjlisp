@@ -199,6 +199,47 @@ object concat(object obj1, object obj2) {
     return obj;
 }
 
+/* Check if OBJ is of given TYPE.  Return 1 on success, 0 and signal
+ * an error on failure. */
+int assert_type(object obj, object_type_t type) {
+    const char *type_string;
+    switch (type) {
+    case T_BUILTIN:
+        type_string = "builtin-function-p";
+        break;
+    case T_SYMBOL:
+        type_string = "symbolp";
+        break;
+    case T_STRING:
+        type_string = "stringp";
+        break;
+    case T_FIXNUM:
+        type_string = "numberp";
+        break;
+    case T_CONS:
+        type_string = "consp";
+        break;
+    case T_LAMBDA:
+        type_string = "functionp";
+        break;
+    default:
+        error("assert_type");
+    }
+
+    if (NILP(obj)) {
+        signal(intern("wrong-type-argument"),
+               make_cons(intern(type_string), NULL));
+        return 0;
+    }
+    if (obj->type != type) {
+        signal(intern("wrong-type-argument"),
+               make_cons(intern(type_string), obj));
+        return 0;
+    }
+
+    return 1;
+}
+
 
 /* Hash */
 
@@ -767,9 +808,7 @@ DEFMACRO("progn", Sprogn, Fprogn, MANY)
 
 DEFUN("set", Sset, Fset, 2)
 (object symbol, object value) {
-    if (!SYMBOLP(symbol)) {
-        signal(intern("wrong-type-argument"),
-               make_cons(intern("symbolp"), symbol));
+    if (!assert_type(symbol, T_SYMBOL)) {
         return NULL;
     }
 
@@ -806,8 +845,7 @@ DEFUN("concat", Sconcat, Fconcat, 2)
 
 DEFUN("car", Scar, Fcar, 1)
 (object arg) {
-    if (!(NILP(arg) || CONSP(arg))) {
-        signal(intern("wrong-type-argument"), intern("consp"));
+    if (!NILP(arg) && !assert_type(arg, T_CONS)) {
         return NULL;
     }
 
@@ -816,8 +854,7 @@ DEFUN("car", Scar, Fcar, 1)
 
 DEFUN("cdr", Scdr, Fcdr, 1)
 (object arg) {
-    if (!(NILP(arg) || CONSP(arg))) {
-        signal(intern("wrong-type-argument"), intern("consp"));
+    if (!NILP(arg) && !assert_type(arg, T_CONS)) {
         return NULL;
     }
 
@@ -887,8 +924,7 @@ DEFUN("stringify", Sstringify, Fstringify, 1)
 
 DEFMACRO("lambda", Slambda, Flambda, MANY)
 (object args) {
-    if (!CONSP(XCAR(args)) && !NILP(XCAR(args))) {
-        signal(intern("wrong-type-argument"), intern("consp"));
+    if (!NILP(XCAR(args)) && !assert_type(XCAR(args), T_CONS)) {
         return NULL;
     }
 
@@ -896,8 +932,7 @@ DEFMACRO("lambda", Slambda, Flambda, MANY)
     object arg = XCAR(args);
     object arglist = arg;
     while (CONSP(arg)) {
-        if (!SYMBOLP(XCAR(arg))) {
-            signal(intern("wrong-type-argument"), intern("symbolp"));
+        if (!assert_type(XCAR(arg), T_SYMBOL)) {
             return NULL;
         }
         arg = XCDR(arg);
@@ -973,8 +1008,7 @@ DEFUN("+", Splus, Fplus, MANY)
 
     while (CONSP(args)) {
         object val = XCAR(args);
-        if (!FIXNUMP(val)) {
-            signal(intern("wrong-type-argument"), intern("numberp"));
+        if (!assert_type(XCAR(args), T_FIXNUM)) {
             return NULL;
         }
         ret += XINT(val);
@@ -989,8 +1023,7 @@ DEFUN("-", Sminus, Fminus, MANY)
     int ret = 0;
 
     if (CONSP(args)) {
-        if (!FIXNUMP(XCAR(args))) {
-            signal(intern("wrong-type-argument"), intern("numberp"));
+        if (!assert_type(XCAR(args), T_FIXNUM)) {
             return NULL;
         }
         ret = XINT(XCAR(args));
@@ -1002,8 +1035,7 @@ DEFUN("-", Sminus, Fminus, MANY)
 
     while (CONSP(args)) {
         object val = XCAR(args);
-        if (!FIXNUMP(val)) {
-            signal(intern("wrong-type-argument"), intern("numberp"));
+        if (!assert_type(XCAR(args), T_FIXNUM)) {
             return NULL;
         }
         ret -= XINT(val);
@@ -1019,8 +1051,7 @@ DEFUN("*", Smultiply, Fmultiply, MANY)
 
     while (CONSP(args)) {
         object val = XCAR(args);
-        if (!FIXNUMP(val)) {
-            signal(intern("wrong-type-argument"), intern("numberp"));
+        if (!assert_type(XCAR(args), T_FIXNUM)) {
             return NULL;
         }
         ret *= XINT(val);
@@ -1032,12 +1063,7 @@ DEFUN("*", Smultiply, Fmultiply, MANY)
 
 DEFUN("<", Sless, Fless, 2)
 (object number1, object number2) {
-    if (!FIXNUMP(number1)) {
-        signal(intern("wrong-type-argument"), number1);
-        return NULL;
-    }
-    if (!FIXNUMP(number2)) {
-        signal(intern("wrong-type-argument"), number2);
+    if (!assert_type(number1, T_FIXNUM) || !assert_type(number2, T_FIXNUM)) {
         return NULL;
     }
     if (XINT(number1) < XINT(number2)) {
